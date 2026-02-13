@@ -1,1 +1,837 @@
 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+C++ Header Function Scanner (best-effort, dependency-free)
+=========================================================
+
+Scans header files (*.h / *.hpp / *.hh), extracts function-like signatures (declarations + inline defs),
+and helps you *find duplicates* and *search/sort by details* like:
+
+- function name
+- normalized parameter types (names/defaults removed)
+- arity (parameter count)
+- qualifiers (const/noexcept/&, &&, etc. best-effort)
+- location (file/line)
+- raw compact signature (for debugging)
+
+This is NOT a full C++ parser. If you need 100% correctness (macros/templates edge cases), use clang/libclang.
+But for "what’s duplicated across my headers?" this works well and is easy to tweak.
+
+Outputs:
+- SQLite DB (optional)
+- sorted list
+- duplicates report (configurable grouping key)
+- optional CSV/JSON
+
+Examples:
+  python scan_headers.py --recursive
+  python scan_headers.py --recursive --group-by signature
+  python scan_headers.py --recursive --group-by name_params
+  python scan_headers.py --recursive --filter-name "GetMinimum" --sort-by file
+  python scan_headers.py --recursive --filter-param "std::vector" --group-by name_arity
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import sqlite3
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+
+# =============================================================================
+# Comment stripping (preserve line numbers)
+# =============================================================================
+
+def strip_comments_preserve_lines(src: str) -> str:
+    """Remove // and /* */ comments while preserving newlines (line numbers stay valid)."""
+    i = 0
+    n = len(src)
+    out: List[str] = []
+    in_sl_comment = False
+    in_ml_comment = False
+    in_str: Optional[str] = None
+    escape = False
+
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+
+        if in_sl_comment:
+            if ch == "\n":
+                in_sl_comment = False
+                out.append("\n")
+            else:
+                out.append(" ")
+            i += 1
+            continue
+
+        if in_ml_comment:
+            if ch == "*" and nxt == "/":
+                in_ml_comment = False
+                out.append("  ")
+                i += 2
+            else:
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+            continue
+
+        if in_str is not None:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_str:
+                in_str = None
+            i += 1
+            continue
+
+        if ch in ("'", '"'):
+            in_str = ch
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_sl_comment = True
+            out.append("  ")
+            i += 2
+            continue
+
+        if ch == "/" and nxt == "*":
+            in_ml_comment = True
+            out.append("  ")
+            i += 2
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+# =============================================================================
+# Statement splitting (best-effort)
+# =============================================================================
+
+def iter_statements(src: str) -> Iterable[Tuple[str, int, str]]:
+    """
+    Yield (statement_text, start_line, terminator_char) for statements terminated by ';' or '{'
+    when paren-depth == 0. Keeps line numbers usable.
+    """
+    stmt: List[str] = []
+    start_line = 1
+    line = 1
+
+    paren = 0
+    in_str: Optional[str] = None
+    escape = False
+    seen_non_ws = False
+
+    for ch in src:
+        stmt.append(ch)
+
+        if ch == "\n":
+            line += 1
+            if not seen_non_ws:
+                start_line = line
+
+        if in_str is not None:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_str:
+                in_str = None
+            continue
+
+        if ch in ("'", '"'):
+            in_str = ch
+            continue
+
+        if not seen_non_ws and not ch.isspace():
+            seen_non_ws = True
+
+        if ch == "(":
+            paren += 1
+        elif ch == ")" and paren > 0:
+            paren -= 1
+        elif ch in (";", "{") and paren == 0:
+            text = "".join(stmt)
+            yield text, start_line, ch
+            stmt = []
+            seen_non_ws = False
+            start_line = line
+
+
+# =============================================================================
+# Extraction & normalization
+# =============================================================================
+
+ATTR_RE = re.compile(r"\[\[.*?\]\]", re.DOTALL)
+PREPROCESSOR_RE = re.compile(r"^\s*#", re.MULTILINE)
+
+CONTROL_KEYWORDS = {"if", "for", "while", "switch", "catch", "return", "sizeof", "static_assert"}
+
+
+def _compact_ws(s: str) -> str:
+    return " ".join(s.strip().split())
+
+
+def _find_outer_paren(s: str) -> Optional[int]:
+    """Find the '(' that starts the *outer* parameter list, ignoring '<...>' template depth best-effort."""
+    in_str = None
+    escape = False
+    depth_angle = 0
+
+    for i, ch in enumerate(s):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            continue
+
+        if ch == "<":
+            depth_angle += 1
+        elif ch == ">" and depth_angle > 0:
+            depth_angle -= 1
+        elif ch == "(" and depth_angle == 0:
+            return i
+    return None
+
+
+def _find_matching_paren(s: str, open_idx: int) -> Optional[int]:
+    depth = 0
+    in_str = None
+    escape = False
+
+    for i in range(open_idx, len(s)):
+        ch = s[i]
+
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            continue
+
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
+def _split_params(param_str: str) -> List[str]:
+    """Split parameter list by commas at depth 0 across (), <>, [], {}."""
+    params: List[str] = []
+    cur: List[str] = []
+    d_paren = d_angle = d_brack = d_brace = 0
+    in_str = None
+    escape = False
+
+    for ch in param_str:
+        if in_str:
+            cur.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_str:
+                in_str = None
+            continue
+
+        if ch in ("'", '"'):
+            in_str = ch
+            cur.append(ch)
+            continue
+
+        if ch == "(":
+            d_paren += 1
+        elif ch == ")" and d_paren > 0:
+            d_paren -= 1
+        elif ch == "<":
+            d_angle += 1
+        elif ch == ">" and d_angle > 0:
+            d_angle -= 1
+        elif ch == "[":
+            d_brack += 1
+        elif ch == "]" and d_brack > 0:
+            d_brack -= 1
+        elif ch == "{":
+            d_brace += 1
+        elif ch == "}" and d_brace > 0:
+            d_brace -= 1
+
+        if ch == "," and d_paren == d_angle == d_brack == d_brace == 0:
+            params.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+
+    tail = "".join(cur).strip()
+    if tail:
+        params.append(tail)
+    return params
+
+
+def _strip_default_value(p: str) -> str:
+    """Remove '= ...' at depth 0 (best-effort)."""
+    d_paren = d_angle = d_brack = d_brace = 0
+    in_str = None
+    escape = False
+
+    for i, ch in enumerate(p):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            continue
+
+        if ch == "(":
+            d_paren += 1
+        elif ch == ")" and d_paren > 0:
+            d_paren -= 1
+        elif ch == "<":
+            d_angle += 1
+        elif ch == ">" and d_angle > 0:
+            d_angle -= 1
+        elif ch == "[":
+            d_brack += 1
+        elif ch == "]" and d_brack > 0:
+            d_brack -= 1
+        elif ch == "{":
+            d_brace += 1
+        elif ch == "}" and d_brace > 0:
+            d_brace -= 1
+
+        if ch == "=" and d_paren == d_angle == d_brack == d_brace == 0:
+            return p[:i].strip()
+    return p.strip()
+
+
+def _strip_param_name(p: str) -> str:
+    """
+    Heuristic: remove trailing identifier that looks like a variable name.
+    Keeps '*', '&', '&&', '...'.
+    """
+    p = p.strip()
+    if not p or p == "void":
+        return ""
+
+    if p.endswith("..."):
+        return p
+
+    m = re.search(r"(.*?)(\b[A-Za-z_]\w*\b)\s*$", p)
+    if not m:
+        return p
+
+    before = m.group(1).rstrip()
+    name = m.group(2)
+
+    if name in {"const", "volatile", "mutable"}:
+        return p
+
+    # If there's whitespace, last identifier is likely a param name => remove it.
+    if " " in p.strip():
+        return before
+
+    return p
+
+
+def _normalize_params(params_raw: List[str]) -> List[str]:
+    """Normalize parameters so they are comparable/sortable/searchable."""
+    norm: List[str] = []
+    for p in params_raw:
+        p = _strip_default_value(p)
+        p = _strip_param_name(p)
+        p = _compact_ws(p)
+        if p:
+            norm.append(p)
+    return norm
+
+
+def _normalize_qualifiers(q: str) -> str:
+    """
+    Best-effort qualifier normalization. Keeps things useful for duplicate detection.
+    Drops override/final because they don't usually matter for "duplicate signatures in headers".
+    """
+    q = _compact_ws(q)
+    q = re.sub(r"\b(override|final)\b", "", q)
+    q = _compact_ws(q)
+    return q
+
+
+def _extract_name(prefix: str) -> Optional[str]:
+    """Extract function/method name from the text before '('. Supports scoped names and operator overloads."""
+    prefix = _compact_ws(ATTR_RE.sub(" ", prefix.strip()))
+    if not prefix:
+        return None
+
+    first_word = prefix.split(None, 1)[0] if prefix.split() else ""
+    if first_word in CONTROL_KEYWORDS:
+        return None
+
+    op = re.search(r"(operator\s*[^ \t(]+)\s*$", prefix)
+    if op:
+        return _compact_ws(op.group(1))
+
+    m = re.search(r"([~A-Za-z_]\w*(?:::[~A-Za-z_]\w*)*)\s*$", prefix)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _build_signature(name: str, params_norm: List[str], qualifiers_norm: str) -> str:
+    core = f"{name}({', '.join(params_norm)})"
+    return _compact_ws(core + ((" " + qualifiers_norm) if qualifiers_norm else ""))
+
+
+@dataclass
+class FunctionRecord:
+    # identity-ish parts
+    name: str                      # e.g. Math::RealNoise::GetMinimum
+    params_raw: str                # raw "(...)" content compacted
+    params_norm: str               # normalized params joined (for searching)
+    qualifiers: str                # normalized qualifiers after ')'
+    arity: int                     # parameter count after normalization
+
+    # full signatures
+    signature_raw: str             # 1-line compact raw statement
+    signature_norm: str            # normalized signature used by default for duplicates
+
+    # location/meta
+    file: str
+    line: int
+    kind: str                      # decl / def
+
+
+def extract_functions_from_text(text: str, rel_path: str) -> List[FunctionRecord]:
+    cleaned = strip_comments_preserve_lines(text)
+    cleaned = PREPROCESSOR_RE.sub("", cleaned)
+
+    out: List[FunctionRecord] = []
+
+    for stmt, start_line, end_char in iter_statements(cleaned):
+        s = stmt.strip()
+        if not s:
+            continue
+
+        # skip obvious non-function statements
+        if s.startswith(("using ", "typedef ", "enum ", "struct ", "class ")):
+            continue
+
+        open_idx = _find_outer_paren(s)
+        if open_idx is None:
+            continue
+        close_idx = _find_matching_paren(s, open_idx)
+        if close_idx is None:
+            continue
+
+        prefix = s[:open_idx].strip()
+        name = _extract_name(prefix)
+        if not name:
+            continue
+
+        params_str = s[open_idx + 1:close_idx].strip()
+        params_list_raw = _split_params(params_str) if params_str else []
+        params_norm_list = _normalize_params(params_list_raw)
+
+        suffix = s[close_idx + 1:]
+        suffix = suffix.replace(";", " ").replace("{", " ")
+        suffix = _compact_ws(ATTR_RE.sub(" ", suffix))
+        qualifiers_norm = _normalize_qualifiers(suffix)
+
+        raw_one_line = _compact_ws(s.rstrip(";{").strip())
+        sig_norm = _build_signature(name, params_norm_list, qualifiers_norm)
+
+        kind = "def" if end_char == "{" else "decl"
+
+        out.append(FunctionRecord(
+            name=name,
+            params_raw=_compact_ws(params_str),
+            params_norm=", ".join(params_norm_list),
+            qualifiers=qualifiers_norm,
+            arity=len(params_norm_list),
+            signature_raw=raw_one_line,
+            signature_norm=sig_norm,
+            file=rel_path,
+            line=start_line,
+            kind=kind
+        ))
+
+    return out
+
+
+# =============================================================================
+# Walking + outputs
+# =============================================================================
+
+def walk_headers(root: Path, recursive: bool, exts: Tuple[str, ...]) -> List[Path]:
+    if recursive:
+        files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts]
+    else:
+        files = [p for p in root.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    return sorted(files)
+
+
+def write_sqlite(db_path: Path, records: List[FunctionRecord]) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(db_path))
+    try:
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS functions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                params_raw TEXT NOT NULL,
+                params_norm TEXT NOT NULL,
+                qualifiers TEXT NOT NULL,
+                arity INTEGER NOT NULL,
+                signature_raw TEXT NOT NULL,
+                signature_norm TEXT NOT NULL,
+                file TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                kind TEXT NOT NULL
+            )
+        """)
+        cur.execute("DELETE FROM functions")
+        cur.executemany(
+            """INSERT INTO functions
+               (name, params_raw, params_norm, qualifiers, arity, signature_raw, signature_norm, file, line, kind)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [(r.name, r.params_raw, r.params_norm, r.qualifiers, r.arity, r.signature_raw, r.signature_norm, r.file, r.line, r.kind)
+             for r in records]
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_norm ON functions(signature_norm)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_name ON functions(name)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_params ON functions(params_norm)")
+        con.commit()
+    finally:
+        con.close()
+
+
+def write_csv(csv_path: Path, records: List[FunctionRecord]) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "name", "params_raw", "params_norm", "qualifiers", "arity",
+            "signature_raw", "signature_norm", "file", "line", "kind"
+        ])
+        for r in records:
+            w.writerow([
+                r.name, r.params_raw, r.params_norm, r.qualifiers, r.arity,
+                r.signature_raw, r.signature_norm, r.file, r.line, r.kind
+            ])
+
+
+def write_json(json_path: Path, records: List[FunctionRecord]) -> None:
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump([asdict(r) for r in records], f, ensure_ascii=False, indent=2)
+
+
+def _sort_key(sort_by: str):
+    sort_by = sort_by.lower()
+    if sort_by == "signature":
+        return lambda r: (r.signature_norm.lower(), r.file.lower(), r.line)
+    if sort_by == "name":
+        return lambda r: (r.name.lower(), r.arity, r.qualifiers.lower(), r.file.lower(), r.line)
+    if sort_by == "arity":
+        return lambda r: (r.arity, r.name.lower(), r.file.lower(), r.line)
+    if sort_by == "file":
+        return lambda r: (r.file.lower(), r.line, r.signature_norm.lower())
+    if sort_by == "line":
+        return lambda r: (r.line, r.file.lower(), r.signature_norm.lower())
+    # fallback
+    return lambda r: (r.signature_norm.lower(), r.file.lower(), r.line)
+
+
+def write_sorted_list(path: Path, records: List[FunctionRecord], sort_by: str) -> None:
+    """
+    Write a sortable list. Useful when you want to eyeball and grep for patterns.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    recs = sorted(records, key=_sort_key(sort_by))
+    with path.open("w", encoding="utf-8") as f:
+        for r in recs:
+            f.write(
+                f"{r.signature_norm}\t"
+                f"[{r.kind}] "
+                f"{r.file}:{r.line}\t"
+                f"arity={r.arity}\t"
+                f"params=[{r.params_norm}]\t"
+                f"qual=[{r.qualifiers}]\n"
+            )
+
+
+# =============================================================================
+# Duplicates: configurable grouping and more "details-aware" modes
+# =============================================================================
+
+def _group_key(r: FunctionRecord, group_by: str) -> str:
+    """
+    Configure how duplicates are grouped.
+    This is the core “theoretically you can group by params/other details” hook.
+
+    Options:
+      - signature     : name + normalized params + normalized qualifiers  (default; strictest useful)
+      - name          : only function name (ignores params/qualifiers)
+      - name_params   : name + normalized params (ignores qualifiers)
+      - name_arity    : name + arity (parameter count) (very loose)
+      - name_qual     : name + qualifiers (ignores params)
+      - params        : only normalized params (rare, but sometimes useful)
+    """
+    gb = group_by.lower()
+
+    if gb == "signature":
+        return r.signature_norm
+    if gb == "name":
+        return r.name
+    if gb == "name_params":
+        return f"{r.name}({r.params_norm})"
+    if gb == "name_arity":
+        return f"{r.name}#arity={r.arity}"
+    if gb == "name_qual":
+        return f"{r.name} {r.qualifiers}".strip()
+    if gb == "params":
+        return r.params_norm
+    # fallback to strict signature
+    return r.signature_norm
+
+
+def write_duplicates(
+    path: Path,
+    records: List[FunctionRecord],
+    group_by: str = "signature",
+    include_decl: bool = True,
+    include_def: bool = True,
+) -> Tuple[int, int]:
+    """
+    Write duplicates grouped by a chosen key.
+
+    Why configurable?
+      Because "duplicate" can mean different things:
+        - exact same normalized signature (default)
+        - same name across files (API collisions)
+        - same name+params ignoring qualifiers (const/noexcept drift)
+        - same name+arity (very rough scan)
+
+    Returns:
+      (duplicate_groups, duplicate_occurrences)
+    """
+    # filter by kind (if user wants)
+    filtered: List[FunctionRecord] = []
+    for r in records:
+        if r.kind == "decl" and not include_decl:
+            continue
+        if r.kind == "def" and not include_def:
+            continue
+        filtered.append(r)
+
+    groups: Dict[str, List[FunctionRecord]] = {}
+    for r in filtered:
+        k = _group_key(r, group_by)
+        groups.setdefault(k, []).append(r)
+
+    dup_items = [(k, lst) for k, lst in groups.items() if len(lst) > 1]
+    dup_items.sort(key=lambda x: x[0].lower())
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        f.write(f"# Duplicates report\n")
+        f.write(f"# group_by = {group_by}\n")
+        f.write(f"# include_decl = {include_decl}, include_def = {include_def}\n\n")
+
+        for k, lst in dup_items:
+            f.write(f"{k}  (x{len(lst)})\n")
+
+            # stable ordering: file then line
+            lst_sorted = sorted(lst, key=lambda r: (r.file.lower(), r.line))
+
+            for r in lst_sorted:
+                # print additional details so you can “search/sort by params/qualifiers/etc”
+                f.write(
+                    f"  - [{r.kind}] {r.file}:{r.line} | "
+                    f"name={r.name} | arity={r.arity} | "
+                    f"params=[{r.params_norm}] | qual=[{r.qualifiers}] | "
+                    f"raw={r.signature_raw}\n"
+                )
+            f.write("\n")
+
+    duplicate_groups = len(dup_items)
+    duplicate_occurrences = sum(len(lst) for _, lst in dup_items)
+    return duplicate_groups, duplicate_occurrences
+
+
+# =============================================================================
+# Filtering (search) helpers
+# =============================================================================
+
+def _compile_optional_regex(pattern: str) -> Optional[re.Pattern]:
+    if not pattern:
+        return None
+    return re.compile(pattern)
+
+
+def filter_records(
+    records: List[FunctionRecord],
+    name_re: Optional[re.Pattern],
+    sig_re: Optional[re.Pattern],
+    file_re: Optional[re.Pattern],
+    param_re: Optional[re.Pattern],
+    qual_re: Optional[re.Pattern],
+) -> List[FunctionRecord]:
+    """
+    Filter records by regex on specific “details”:
+      - name
+      - normalized signature
+      - file path
+      - normalized params
+      - normalized qualifiers
+    """
+    out: List[FunctionRecord] = []
+    for r in records:
+        if name_re and not name_re.search(r.name):
+            continue
+        if sig_re and not sig_re.search(r.signature_norm):
+            continue
+        if file_re and not file_re.search(r.file):
+            continue
+        if param_re and not param_re.search(r.params_norm):
+            continue
+        if qual_re and not qual_re.search(r.qualifiers):
+            continue
+        out.append(r)
+    return out
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Extract C/C++ function signatures from header files and find duplicates.")
+    ap.add_argument("--root", type=str, default=".", help="Root folder to scan (default: current folder).")
+    ap.add_argument("--recursive", action="store_true", help="Scan recursively (default: only direct children).")
+    ap.add_argument("--ext", nargs="*", default=[".h", ".hpp", ".hh"], help="Extensions to scan.")
+
+    # outputs
+    ap.add_argument("--db", type=str, default="functions.sqlite", help="SQLite output path.")
+    ap.add_argument("--csv", type=str, default="", help="Optional CSV output path.")
+    ap.add_argument("--json", type=str, default="", help="Optional JSON output path.")
+    ap.add_argument("--sorted", type=str, default="functions_sorted.txt", help="Sorted list output path.")
+    ap.add_argument("--duplicates", type=str, default="duplicates.txt", help="Duplicates output path.")
+
+    # sorting / grouping / search
+    ap.add_argument("--sort-by", type=str, default="signature",
+                    choices=["signature", "name", "arity", "file", "line"],
+                    help="Sorting for the sorted list output.")
+    ap.add_argument("--group-by", type=str, default="signature",
+                    choices=["signature", "name", "name_params", "name_arity", "name_qual", "params"],
+                    help="How duplicates are grouped.")
+
+    ap.add_argument("--filter-name", type=str, default="", help="Regex filter on function name.")
+    ap.add_argument("--filter-sig", type=str, default="", help="Regex filter on normalized signature.")
+    ap.add_argument("--filter-file", type=str, default="", help="Regex filter on file path.")
+    ap.add_argument("--filter-param", type=str, default="", help="Regex filter on normalized params.")
+    ap.add_argument("--filter-qual", type=str, default="", help="Regex filter on qualifiers.")
+
+    ap.add_argument("--no-decl", action="store_true", help="Exclude declarations from duplicates report.")
+    ap.add_argument("--no-def", action="store_true", help="Exclude inline definitions from duplicates report.")
+
+    args = ap.parse_args()
+
+    root = Path(args.root).resolve()
+    exts = tuple(e.lower() if e.startswith(".") else "." + e.lower() for e in args.ext)
+
+    files = walk_headers(root, args.recursive, exts)
+    if not files:
+        print(f"No header files found in {root} with extensions {exts}")
+        return 1
+
+    # extract
+    records: List[FunctionRecord] = []
+    for p in files:
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            print(f"[WARN] Failed reading {p}: {e}")
+            continue
+        rel = str(p.relative_to(root))
+        records.extend(extract_functions_from_text(text, rel))
+
+    # apply filters (search-by-details)
+    name_re = _compile_optional_regex(args.filter_name)
+    sig_re = _compile_optional_regex(args.filter_sig)
+    file_re = _compile_optional_regex(args.filter_file)
+    param_re = _compile_optional_regex(args.filter_param)
+    qual_re = _compile_optional_regex(args.filter_qual)
+
+    records = filter_records(records, name_re, sig_re, file_re, param_re, qual_re)
+
+    # write outputs
+    db_path = (root / args.db) if not os.path.isabs(args.db) else Path(args.db)
+    write_sqlite(db_path, records)
+
+    if args.csv:
+        csv_path = (root / args.csv) if not os.path.isabs(args.csv) else Path(args.csv)
+        write_csv(csv_path, records)
+
+    if args.json:
+        json_path = (root / args.json) if not os.path.isabs(args.json) else Path(args.json)
+        write_json(json_path, records)
+
+    sorted_path = (root / args.sorted) if not os.path.isabs(args.sorted) else Path(args.sorted)
+    write_sorted_list(sorted_path, records, sort_by=args.sort_by)
+
+    dup_path = (root / args.duplicates) if not os.path.isabs(args.duplicates) else Path(args.duplicates)
+    dup_groups, dup_occ = write_duplicates(
+        dup_path,
+        records,
+        group_by=args.group_by,
+        include_decl=not args.no_decl,
+        include_def=not args.no_def,
+    )
+
+    unique = len({_group_key(r, "signature") for r in records})
+    print(f"Scanned: {len(files)} header files")
+    print(f"Found:   {len(records)} function-like signatures (after filters)")
+    print(f"Unique (strict signature): {unique}")
+    print(f"Duplicates: {dup_groups} groups / {dup_occ} occurrences (group_by={args.group_by})")
+    print(f"Wrote DB: {db_path}")
+    print(f"Wrote sorted: {sorted_path}")
+    print(f"Wrote duplicates: {dup_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
