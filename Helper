@@ -1,1 +1,559 @@
-x
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+scan_headers.py
+Best-effort extractor for C/C++ function declarations/inline defs from header files.
+
+Outputs:
+- SQLite DB with raw + normalized signatures
+- CSV/JSON (optional)
+- duplicates report (grouped by normalized signature)
+
+Usage examples:
+  python scan_headers.py
+  python scan_headers.py --recursive
+  python scan_headers.py --root /path/to/project --recursive --csv out.csv --json out.json --db functions.sqlite --duplicates duplicates.txt
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import sqlite3
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Iterable, List, Optional, Tuple, Dict
+
+
+# -------------------------
+# Utilities: comment stripping
+# -------------------------
+
+def strip_comments_preserve_lines(src: str) -> str:
+    """
+    Remove // and /* */ comments while preserving newlines, so line numbers remain usable.
+    """
+    i = 0
+    n = len(src)
+    out = []
+    in_sl_comment = False
+    in_ml_comment = False
+    in_str: Optional[str] = None  # '"' or "'"
+    escape = False
+
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+
+        if in_sl_comment:
+            if ch == "\n":
+                in_sl_comment = False
+                out.append("\n")
+            else:
+                out.append(" ")  # preserve columns roughly
+            i += 1
+            continue
+
+        if in_ml_comment:
+            if ch == "*" and nxt == "/":
+                in_ml_comment = False
+                out.append("  ")
+                i += 2
+            else:
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+            continue
+
+        if in_str is not None:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_str:
+                in_str = None
+            i += 1
+            continue
+
+        # not in comment/string
+        if ch in ("'", '"'):
+            in_str = ch
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_sl_comment = True
+            out.append("  ")
+            i += 2
+            continue
+
+        if ch == "/" and nxt == "*":
+            in_ml_comment = True
+            out.append("  ")
+            i += 2
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+# -------------------------
+# Statement splitting
+# -------------------------
+
+def iter_statements(src: str) -> Iterable[Tuple[str, int, str]]:
+    """
+    Yield (statement_text, start_line, end_char) for statements terminated by ';' or '{'
+    when at top-level paren depth == 0.
+    """
+    stmt = []
+    start_line = 1
+    line = 1
+
+    paren = 0
+    in_str: Optional[str] = None
+    escape = False
+
+    # track when statement becomes non-whitespace
+    seen_non_ws = False
+
+    for ch in src:
+        stmt.append(ch)
+
+        if ch == "\n":
+            line += 1
+            if not seen_non_ws:
+                start_line = line
+
+        if in_str is not None:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_str:
+                in_str = None
+            continue
+
+        if ch in ("'", '"'):
+            in_str = ch
+            continue
+
+        if not seen_non_ws and not ch.isspace():
+            seen_non_ws = True
+
+        if ch == "(":
+            paren += 1
+        elif ch == ")" and paren > 0:
+            paren -= 1
+        elif ch in (";", "{") and paren == 0:
+            text = "".join(stmt)
+            yield text, start_line, ch
+            stmt = []
+            seen_non_ws = False
+            start_line = line
+
+    # trailing fragment ignored
+
+
+# -------------------------
+# Signature extraction & normalization
+# -------------------------
+
+ATTR_RE = re.compile(r"\[\[.*?\]\]", re.DOTALL)
+PREPROCESSOR_RE = re.compile(r"^\s*#", re.MULTILINE)
+
+CONTROL_KEYWORDS = {"if", "for", "while", "switch", "catch", "return", "sizeof", "static_assert"}
+
+@dataclass
+class FunctionRecord:
+    name: str
+    signature_raw: str
+    signature_norm: str
+    file: str
+    line: int
+    kind: str  # "decl" or "def"
+
+
+def _find_outer_paren(s: str) -> Optional[int]:
+    """
+    Find the index of the first '(' that starts the outer parameter list (paren depth 0 -> 1),
+    ignoring those inside templates/attributes as best we can.
+    """
+    in_str = None
+    escape = False
+    depth_angle = 0
+
+    for i, ch in enumerate(s):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            continue
+
+        if ch == "<":
+            depth_angle += 1
+        elif ch == ">" and depth_angle > 0:
+            depth_angle -= 1
+        elif ch == "(" and depth_angle == 0:
+            return i
+    return None
+
+
+def _find_matching_paren(s: str, open_idx: int) -> Optional[int]:
+    depth = 0
+    in_str = None
+    escape = False
+    for i in range(open_idx, len(s)):
+        ch = s[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            continue
+
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
+def _split_params(param_str: str) -> List[str]:
+    """
+    Split parameter list by commas at depth 0 across (), <>, [], {}.
+    """
+    params = []
+    cur = []
+    d_paren = d_angle = d_brack = d_brace = 0
+    in_str = None
+    escape = False
+
+    for ch in param_str:
+        if in_str:
+            cur.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            cur.append(ch)
+            continue
+
+        if ch == "(":
+            d_paren += 1
+        elif ch == ")" and d_paren > 0:
+            d_paren -= 1
+        elif ch == "<":
+            d_angle += 1
+        elif ch == ">" and d_angle > 0:
+            d_angle -= 1
+        elif ch == "[":
+            d_brack += 1
+        elif ch == "]" and d_brack > 0:
+            d_brack -= 1
+        elif ch == "{":
+            d_brace += 1
+        elif ch == "}" and d_brace > 0:
+            d_brace -= 1
+
+        if ch == "," and d_paren == d_angle == d_brack == d_brace == 0:
+            params.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+
+    tail = "".join(cur).strip()
+    if tail:
+        params.append(tail)
+    return params
+
+
+def _strip_default_value(p: str) -> str:
+    # remove "= ..." at depth 0 (best-effort; most defaults are simple)
+    d_paren = d_angle = d_brack = d_brace = 0
+    in_str = None
+    escape = False
+    for i, ch in enumerate(p):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            continue
+
+        if ch == "(":
+            d_paren += 1
+        elif ch == ")" and d_paren > 0:
+            d_paren -= 1
+        elif ch == "<":
+            d_angle += 1
+        elif ch == ">" and d_angle > 0:
+            d_angle -= 1
+        elif ch == "[":
+            d_brack += 1
+        elif ch == "]" and d_brack > 0:
+            d_brack -= 1
+        elif ch == "{":
+            d_brace += 1
+        elif ch == "}" and d_brace > 0:
+            d_brace -= 1
+
+        if ch == "=" and d_paren == d_angle == d_brack == d_brace == 0:
+            return p[:i].strip()
+    return p.strip()
+
+
+def _strip_param_name(p: str) -> str:
+    """
+    Heuristic: remove trailing identifier that looks like a variable name.
+    Keeps '*', '&', '&&', '...'.
+    """
+    p = p.strip()
+    if not p or p == "void":
+        return ""
+
+    # handle ellipsis
+    if p.endswith("..."):
+        return p
+
+    # If it ends with identifier, drop it
+    m = re.search(r"(.*?)(\b[A-Za-z_]\w*\b)\s*$", p)
+    if not m:
+        return p
+
+    before = m.group(1).rstrip()
+    name = m.group(2)
+
+    # Don't strip if "name" is actually a type keyword like "const" (rare but safe)
+    if name in {"const", "volatile", "mutable"}:
+        return p
+
+    # If before ends with scope operator or template close, still likely a name -> strip
+    if before and (before[-1].isalnum() or before[-1] in (">", "&", "*", ")", "]")):
+        # avoid stripping in cases like "operator int" (no params case irrelevant) or function pointer weirdness
+        # If there's no whitespace separating, don't strip.
+        if p.endswith(name) and (" " in p.strip()):
+            return before
+
+    return p
+
+
+def _compact_ws(s: str) -> str:
+    return " ".join(s.strip().split())
+
+
+def _normalize_signature(name: str, params: List[str], qualifiers: str) -> str:
+    # normalize params
+    norm_params = []
+    for p in params:
+        p = _strip_default_value(p)
+        p = _strip_param_name(p)
+        p = _compact_ws(p)
+        if p:
+            norm_params.append(p)
+    # qualifiers: keep const/ref/noexcept; drop override/final
+    q = _compact_ws(qualifiers)
+    q = re.sub(r"\b(override|final)\b", "", q)
+    q = _compact_ws(q)
+
+    core = f"{name}({', '.join(norm_params)})"
+    return _compact_ws(core + (" " + q if q else ""))
+
+
+def _extract_name(prefix: str) -> Optional[str]:
+    """
+    Extract function/method name from prefix (text before the outer '(').
+    Supports scoped names and basic operator overloads.
+    """
+    prefix = prefix.strip()
+    if not prefix:
+        return None
+
+    # remove attributes
+    prefix = ATTR_RE.sub(" ", prefix)
+    prefix = _compact_ws(prefix)
+
+    # quick reject of control statements
+    first_word = prefix.split(None, 1)[0] if prefix.split() else ""
+    if first_word in CONTROL_KEYWORDS:
+        return None
+
+    # operator overloads (best-effort)
+    op = re.search(r"(operator\s*[^ \t(]+)\s*$", prefix)
+    if op:
+        return _compact_ws(op.group(1))
+
+    # normal / scoped name: last token with possible ::
+    m = re.search(r"([~A-Za-z_]\w*(?:::[~A-Za-z_]\w*)*)\s*$", prefix)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def extract_functions_from_text(text: str, rel_path: str) -> List[FunctionRecord]:
+    cleaned = strip_comments_preserve_lines(text)
+
+    # remove preprocessor lines entirely (avoid macro noise)
+    cleaned = PREPROCESSOR_RE.sub("", cleaned)
+
+    out: List[FunctionRecord] = []
+
+    for stmt, start_line, end_char in iter_statements(cleaned):
+        s = stmt.strip()
+        if not s:
+            continue
+
+        # ignore obvious non-function constructs
+        if s.startswith("using ") or s.startswith("typedef ") or s.startswith("enum ") or s.startswith("struct ") or s.startswith("class "):
+            continue
+
+        # must contain parens
+        open_idx = _find_outer_paren(s)
+        if open_idx is None:
+            continue
+        close_idx = _find_matching_paren(s, open_idx)
+        if close_idx is None:
+            continue
+
+        prefix = s[:open_idx].strip()
+        name = _extract_name(prefix)
+        if not name:
+            continue
+
+        # parameters
+        params_str = s[open_idx + 1:close_idx].strip()
+        params = _split_params(params_str) if params_str else []
+
+        # qualifiers after ')', until ';' or '{'
+        suffix = s[close_idx + 1:]
+        suffix = suffix.replace(";", " ").replace("{", " ")
+        suffix = ATTR_RE.sub(" ", suffix)
+        suffix = _compact_ws(suffix)
+
+        # raw signature: compact 1-line
+        raw_one_line = _compact_ws(s.rstrip(";{").strip())
+
+        norm = _normalize_signature(name, params, suffix)
+
+        kind = "def" if end_char == "{" else "decl"
+        out.append(FunctionRecord(
+            name=name,
+            signature_raw=raw_one_line,
+            signature_norm=norm,
+            file=rel_path,
+            line=start_line,
+            kind=kind
+        ))
+
+    return out
+
+
+# -------------------------
+# IO: file walking + outputs
+# -------------------------
+
+def walk_headers(root: Path, recursive: bool, exts: Tuple[str, ...]) -> List[Path]:
+    if recursive:
+        files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts]
+    else:
+        files = [p for p in root.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    return sorted(files)
+
+
+def write_sqlite(db_path: Path, records: List[FunctionRecord]) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(db_path))
+    try:
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS functions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                signature_raw TEXT NOT NULL,
+                signature_norm TEXT NOT NULL,
+                file TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                kind TEXT NOT NULL
+            )
+        """)
+        cur.execute("DELETE FROM functions")
+        cur.executemany(
+            "INSERT INTO functions (name, signature_raw, signature_norm, file, line, kind) VALUES (?, ?, ?, ?, ?, ?)",
+            [(r.name, r.signature_raw, r.signature_norm, r.file, r.line, r.kind) for r in records]
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_norm ON functions(signature_norm)")
+        con.commit()
+    finally:
+        con.close()
+
+
+def write_csv(csv_path: Path, records: List[FunctionRecord]) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["name", "signature_raw", "signature_norm", "file", "line", "kind"])
+        for r in records:
+            w.writerow([r.name, r.signature_raw, r.signature_norm, r.file, r.line, r.kind])
+
+
+def write_json(json_path: Path, records: List[FunctionRecord]) -> None:
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump([asdict(r) for r in records], f, ensure_ascii=False, indent=2)
+
+
+def write_sorted_list(path: Path, records: List[FunctionRecord]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    recs = sorted(records, key=lambda r: r.signature_norm.lower())
+    with path.open("w", encoding="utf-8") as f:
+        for r in recs:
+            f.write(f"{r.signature_norm}\t[{r.kind}] {r.file}:{r.line}\n")
+
+
+def write_duplicates(path: Path, records: List[FunctionRecord]) -> Tuple[int, int]:
+    """
+    Write duplicates grouped by normalized signature.
+    Returns (duplicate_groups, duplicate_occurrences)
+    """
+    groups: Dict[str, List[FunctionRecord]] = {}
+    for r in records:
+        groups.setdefault(r.signature_norm, []).append(r)
+
+    dup_items = [(sig, lst) for sig, lst in groups.items() if len(lst) > 1]
+    dup_items.sort(key=lambda x: x[0].lower())
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for sig, lst in dup_items:
+            f.write(f"{sig}  (x{le
+
