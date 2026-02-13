@@ -555,5 +555,76 @@ def write_duplicates(path: Path, records: List[FunctionRecord]) -> Tuple[int, in
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for sig, lst in dup_items:
-            f.write(f"{sig}  (x{le
+            f.write(f"{sig}  (x{len(lst)})\n")
+            lst_sorted = sorted(lst, key=lambda r: (r.file.lower(), r.line))
+            for r in lst_sorted:
+                f.write(f"  - [{r.kind}] {r.file}:{r.line} | {r.signature_raw}\n")
+            f.write("\n")
+
+    duplicate_groups = len(dup_items)
+    duplicate_occurrences = sum(len(lst) for _, lst in dup_items)
+    return duplicate_groups, duplicate_occurrences
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Extract C/C++ function signatures from header files and find duplicates.")
+    ap.add_argument("--root", type=str, default=".", help="Root folder to scan (default: current folder).")
+    ap.add_argument("--recursive", action="store_true", help="Scan recursively (default: only direct children).")
+    ap.add_argument("--ext", nargs="*", default=[".h", ".hpp", ".hh"], help="Extensions to scan.")
+    ap.add_argument("--db", type=str, default="functions.sqlite", help="SQLite output path.")
+    ap.add_argument("--csv", type=str, default="", help="Optional CSV output path.")
+    ap.add_argument("--json", type=str, default="", help="Optional JSON output path.")
+    ap.add_argument("--sorted", type=str, default="functions_sorted.txt", help="Sorted signatures output path.")
+    ap.add_argument("--duplicates", type=str, default="duplicates.txt", help="Duplicates output path.")
+    args = ap.parse_args()
+
+    root = Path(args.root).resolve()
+    exts = tuple(e.lower() if e.startswith(".") else "." + e.lower() for e in args.ext)
+
+    files = walk_headers(root, args.recursive, exts)
+    if not files:
+        print(f"No header files found in {root} with extensions {exts}")
+        return 1
+
+    all_records: List[FunctionRecord] = []
+    for p in files:
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            print(f"[WARN] Failed reading {p}: {e}")
+            continue
+        rel = str(p.relative_to(root))
+        all_records.extend(extract_functions_from_text(text, rel))
+
+    db_path = (root / args.db) if not os.path.isabs(args.db) else Path(args.db)
+    write_sqlite(db_path, all_records)
+
+    if args.csv:
+        csv_path = (root / args.csv) if not os.path.isabs(args.csv) else Path(args.csv)
+        write_csv(csv_path, all_records)
+
+    if args.json:
+        json_path = (root / args.json) if not os.path.isabs(args.json) else Path(args.json)
+        write_json(json_path, all_records)
+
+    sorted_path = (root / args.sorted) if not os.path.isabs(args.sorted) else Path(args.sorted)
+    write_sorted_list(sorted_path, all_records)
+
+    dup_path = (root / args.duplicates) if not os.path.isabs(args.duplicates) else Path(args.duplicates)
+    dup_groups, dup_occ = write_duplicates(dup_path, all_records)
+
+    unique = len({r.signature_norm for r in all_records})
+    print(f"Scanned: {len(files)} header files")
+    print(f"Found:   {len(all_records)} function-like signatures")
+    print(f"Unique:  {unique}")
+    print(f"Duplicates: {dup_groups} groups / {dup_occ} occurrences")
+    print(f"Wrote DB: {db_path}")
+    print(f"Wrote sorted: {sorted_path}")
+    print(f"Wrote duplicates: {dup_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
 
