@@ -1,0 +1,1149 @@
+---
+title: Sensor Configuration Schema for Unity Infrared and TV Simulation
+tags:
+  - unity
+  - simulation
+  - infrared
+  - thermal
+  - imaging
+  - camera
+  - json
+  - schema
+  - obsidian
+created: 2026-03-12
+---
+
+# Sensor Configuration Schema for Unity Infrared and TV Simulation
+
+## Background
+
+This note documents a proposed JSON-based sensor configuration format for a Unity simulator or game engine that supports both visible (TV / RGB) and infrared imaging. The goal is to describe a virtual imaging system in a way that is technically meaningful, extensible, and practical for implementation.
+
+A realistic imaging chain is not one monolithic camera effect. It is made up of several conceptually different stages:
+
+1. Optics determine how rays are projected, transmitted, focused, and distorted.
+2. Sensor or detector behavior determines how incoming light or radiation becomes a measured response.
+3. Electronics convert that response into digital values and introduce readout-specific effects.
+4. Postprocess stages transform the measured digital signal into something viewable, exportable, or application-ready.
+
+This separation is consistent with common camera characterization and calibration practice. ROS CameraInfo and OpenCV calibration separate intrinsics, distortion, and image geometry. EMVA 1288 models the path from photons to electrons to digital values and defines quantities such as gain, dark noise, DSNU, PRNU, and dynamic range. Thermal-camera documentation also distinguishes detector characteristics, radiometric behavior, and display-oriented steps such as AGC and false color. îciteîturn5search7îturn6search2îturn6search3îturn5search5îturn5search8î
+
+## Purpose
+
+The purpose of this schema is to provide a structured configuration file that can:
+
+- describe visible and infrared sensors in one family of formats
+- support physically motivated behavior where needed
+- keep measurement-side effects separate from display-side processing
+- make results easier to debug and validate
+- integrate cleanly into Unity
+- scale from prototype presets to serious simulation presets
+
+The key idea is that the file should preserve meaning. A noisy image might come from low signal, high gain, read noise, fixed-pattern artifacts, AGC, or sharpening. If all of those are stored as one undifferentiated bag of postprocessing values, the configuration becomes hard to reason about.
+
+## Why separate optics, sensor, electronics, and postprocess?
+
+Many of these things may be implemented as image-space passes or compute shader steps. In that narrow engine sense they all look like postprocessing. But that is not the right conceptual model.
+
+A more useful distinction is:
+
+- optics, sensor, and electronics answer: what would the device have measured?
+- postprocess answers: how is that measured signal transformed for display, storage, or interpretation?
+
+Examples:
+
+- Shot noise belongs to measurement and acquisition.
+- Tone mapping belongs to display preparation.
+- Rolling shutter belongs to timing and readout.
+- AGC in thermal imagery is usually a display aid, not detector physics.
+- False color maps are display choices, not radiometric truth.
+
+That is why one giant postprocess block is usually too vague.
+
+## Recommended schema philosophy
+
+The recommended approach is a domain-separated schema. A strong top-level layout is:
+
+```json
+{
+  "$schema": "https://example.org/schemas/sensor-config.schema.json",
+  "schema_version": "1.0.0",
+
+  "id": "sensor_unique_id",
+  "label": "Human Readable Name",
+  "description": "What this sensor preset is for",
+  "enabled": true,
+
+  "modality": "visible",
+  "variant": "rgb",
+
+  "frames": {},
+  "mount": {},
+  "timing": {},
+
+  "optics": {},
+  "sensor": {},
+  "electronics": {},
+
+  "postprocess": [],
+
+  "output": {},
+  "calibration": {},
+  "environment_assumptions": {},
+  "runtime": {},
+  "validation": {},
+  "provenance": {},
+  "extensions": {}
+}
+```
+
+This gives a good balance between conceptual clarity, engine usability, and future growth.
+
+# Different JSON format ideas
+
+## 1. Flat all-in-one layout
+
+```json
+{
+  "id": "cam_front_ir",
+  "sensor": {},
+  "optics": {},
+  "noise": {},
+  "postprocess": {},
+  "output": {}
+}
+```
+
+### Advantages
+- easy to start with
+- low parser complexity
+- simple manual editing
+
+### Disadvantages
+- gets messy quickly
+- weak conceptual separation
+- difficult to scale
+
+## 2. Domain-separated layout
+
+```json
+{
+  "identity": {},
+  "frames": {},
+  "mount": {},
+  "timing": {},
+  "optics": {},
+  "sensor": {},
+  "electronics": {},
+  "postprocess": [],
+  "output": {},
+  "calibration": {},
+  "provenance": {}
+}
+```
+
+### Advantages
+- clear meaning
+- scalable and maintainable
+- good for both visible and infrared
+- easiest to reason about
+
+### Disadvantages
+- more verbose
+- requires naming discipline
+
+This is the recommended format.
+
+## 3. Pipeline or stage-oriented layout
+
+```json
+{
+  "pipeline": [
+    { "stage": "optics", "model": "pinhole", "params": {} },
+    { "stage": "sensor", "model": "microbolometer", "params": {} },
+    { "stage": "electronics", "model": "generic_adc", "params": {} },
+    { "stage": "agc", "params": {} },
+    { "stage": "colormap", "params": {} }
+  ]
+}
+```
+
+### Advantages
+- very modular
+- naturally represents order
+- close to actual processing graphs
+
+### Disadvantages
+- harder to validate
+- more abstract for humans
+
+## 4. Base config plus overrides
+
+```json
+{
+  "extends": "base_visible_camera.json",
+  "overrides": {
+    "id": "cam_rear_tv",
+    "optics.intrinsics_px.fx": 980.0,
+    "electronics.read_noise_e": 1.8
+  }
+}
+```
+
+### Advantages
+- less duplication
+- great for families of similar sensors
+
+### Disadvantages
+- more complex loader
+- indirect debugging
+
+# Questions to answer before implementation
+
+1. Is the file meant to describe a realistic measured device or just a visually plausible output?
+2. Should one schema support both visible and infrared?
+3. Do you want raw output, processed output, or both?
+4. Which parameters are fixed device properties and which are runtime controls?
+5. Will people edit this JSON manually often?
+6. Do you need preset inheritance or reuse?
+7. Do you need coordinate conventions and mounting inside the file?
+8. Do you need timing details such as rolling shutter and latency?
+9. Will you compare against real or synthetic reference sensors?
+10. Do you care about provenance and source tracking?
+
+# Recommended minimal serious schema
+
+```json
+{
+  "schema_version": "1.0.0",
+  "id": "cam_front_tv",
+  "label": "Front TV Camera",
+  "modality": "visible",
+
+  "frames": {},
+  "mount": {},
+  "timing": {},
+
+  "optics": {},
+  "sensor": {},
+  "electronics": {},
+
+  "postprocess": [],
+
+  "output": {},
+  "runtime": {},
+  "provenance": {}
+}
+```
+
+# Full reusable template
+
+```json
+{
+  "$schema": "https://example.org/schemas/sensor-config.schema.json",
+  "schema_version": "1.0.0",
+
+  "id": "sensor_unique_id",
+  "label": "Human Readable Name",
+  "description": "What this sensor preset is for",
+  "enabled": true,
+
+  "modality": "visible",
+  "variant": "rgb",
+
+  "frames": {
+    "sensor_frame": "cam_front_optical",
+    "parent_frame": "vehicle_base",
+    "handedness": "left",
+    "optical_axis": "forward",
+    "up_axis": "up"
+  },
+
+  "mount": {
+    "position_m": [0.0, 0.0, 0.0],
+    "rotation_deg": [0.0, 0.0, 0.0]
+  },
+
+  "timing": {
+    "sensor_tick_s": 0.033333,
+    "frame_rate_hz": 30.0,
+    "exposure_time_ms": 8.0,
+    "readout_mode": "global_shutter",
+    "readout_time_ms": 0.0,
+    "latency_ms": 0.0,
+    "timestamp_source": "sim_time"
+  },
+
+  "optics": {
+    "projection_model": "pinhole",
+    "resolution_px": [1920, 1080],
+    "intrinsics_px": {
+      "fx": 1200.0,
+      "fy": 1200.0,
+      "cx": 960.0,
+      "cy": 540.0,
+      "skew": 0.0
+    },
+    "distortion": {
+      "model": "plumb_bob",
+      "coeffs": {
+        "k1": 0.0,
+        "k2": 0.0,
+        "p1": 0.0,
+        "p2": 0.0,
+        "k3": 0.0
+      }
+    },
+    "f_number": 2.8,
+    "focus_distance_m": 10.0,
+    "transmittance": 0.95,
+    "vignetting": {
+      "enabled": false
+    }
+  },
+
+  "sensor": {
+    "pixel_pitch_um": 3.45,
+    "cfa_pattern": "RGGB",
+    "quantum_efficiency": 0.5,
+    "full_well_capacity_e": 12000,
+    "spectral_response_ref": null
+  },
+
+  "electronics": {
+    "analog_gain_db": 0.0,
+    "digital_gain": 1.0,
+    "iso_like_gain": 100.0,
+    "black_level_dn": 64,
+    "adc_bits": 12,
+    "saturation_dn": 4095,
+    "read_noise_e": 2.0,
+    "dark_current_e_s": 0.1,
+    "dsnu_dn": 0.5,
+    "prnu_rel": 0.005,
+    "quantization": {
+      "enabled": true
+    },
+    "bad_pixels": {
+      "enabled": false,
+      "density_ppm": 0
+    }
+  },
+
+  "postprocess": [
+    {
+      "stage": "demosaic",
+      "enabled": true,
+      "domain": "raw_to_rgb",
+      "params": {
+        "algorithm": "edge_aware"
+      }
+    },
+    {
+      "stage": "white_balance",
+      "enabled": true,
+      "domain": "rgb_linear",
+      "params": {
+        "mode": "manual",
+        "gains_rgb": [2.0, 1.0, 1.8]
+      }
+    },
+    {
+      "stage": "denoise",
+      "enabled": false,
+      "domain": "rgb_linear",
+      "params": {}
+    },
+    {
+      "stage": "tonemap",
+      "enabled": true,
+      "domain": "display",
+      "params": {
+        "mode": "ACES"
+      }
+    },
+    {
+      "stage": "gamma_encode",
+      "enabled": true,
+      "domain": "display",
+      "params": {
+        "target": "sRGB"
+      }
+    }
+  ],
+
+  "output": {
+    "pixel_format": "RGBA8",
+    "color_space": "sRGB",
+    "transfer_function": "sRGB",
+    "bit_depth": 8,
+    "container": "png",
+    "channels": ["R", "G", "B", "A"],
+    "save_raw": false,
+    "save_processed": true,
+    "include_metadata_sidecar": true
+  },
+
+  "calibration": {
+    "intrinsics_source": "estimated",
+    "distortion_source": "estimated",
+    "oecf_ref": null,
+    "calibration_date": null
+  },
+
+  "environment_assumptions": {},
+
+  "runtime": {
+    "render_pipeline": "HDRP",
+    "shader_variant": "default",
+    "compute_shader": null,
+    "render_scale": 1.0
+  },
+
+  "validation": {
+    "reference_sensor": null,
+    "target_metrics": {}
+  },
+
+  "provenance": {
+    "author": "Your Name",
+    "created_at": "2026-03-06",
+    "notes": "Initial preset"
+  },
+
+  "extensions": {}
+}
+```
+
+# Example: visible TV camera
+
+```json
+{
+  "$schema": "https://example.org/schemas/sensor-config.schema.json",
+  "schema_version": "1.0.0",
+  "id": "cam_front_tv",
+  "label": "Front TV Camera",
+  "description": "Forward visible camera for TV-style output",
+  "enabled": true,
+  "modality": "visible",
+  "variant": "rgb",
+  "frames": {
+    "sensor_frame": "cam_front_optical",
+    "parent_frame": "vehicle_base",
+    "handedness": "left",
+    "optical_axis": "forward",
+    "up_axis": "up"
+  },
+  "mount": {
+    "position_m": [1.25, 0.0, 1.55],
+    "rotation_deg": [0.0, 0.0, 0.0]
+  },
+  "timing": {
+    "sensor_tick_s": 0.033333,
+    "frame_rate_hz": 30.0,
+    "exposure_time_ms": 10.0,
+    "readout_mode": "rolling_shutter",
+    "readout_time_ms": 8.0,
+    "latency_ms": 12.0,
+    "timestamp_source": "sim_time"
+  },
+  "optics": {
+    "projection_model": "pinhole",
+    "resolution_px": [1920, 1080],
+    "intrinsics_px": {
+      "fx": 1400.0,
+      "fy": 1400.0,
+      "cx": 960.0,
+      "cy": 540.0,
+      "skew": 0.0
+    },
+    "distortion": {
+      "model": "plumb_bob",
+      "coeffs": {
+        "k1": -0.08,
+        "k2": 0.02,
+        "p1": 0.0,
+        "p2": 0.0,
+        "k3": 0.0
+      }
+    },
+    "f_number": 2.8,
+    "focus_distance_m": 15.0,
+    "transmittance": 0.93
+  },
+  "sensor": {
+    "pixel_pitch_um": 3.45,
+    "cfa_pattern": "RGGB",
+    "quantum_efficiency": 0.52,
+    "full_well_capacity_e": 13000
+  },
+  "electronics": {
+    "analog_gain_db": 6.0,
+    "digital_gain": 1.0,
+    "iso_like_gain": 400.0,
+    "black_level_dn": 64,
+    "adc_bits": 12,
+    "saturation_dn": 4095,
+    "read_noise_e": 2.4,
+    "dark_current_e_s": 0.15,
+    "dsnu_dn": 0.7,
+    "prnu_rel": 0.004,
+    "quantization": {
+      "enabled": true
+    },
+    "bad_pixels": {
+      "enabled": true,
+      "density_ppm": 15
+    }
+  },
+  "postprocess": [
+    {
+      "stage": "demosaic",
+      "enabled": true,
+      "domain": "raw_to_rgb",
+      "params": {
+        "algorithm": "edge_aware"
+      }
+    },
+    {
+      "stage": "white_balance",
+      "enabled": true,
+      "domain": "rgb_linear",
+      "params": {
+        "mode": "manual",
+        "gains_rgb": [2.1, 1.0, 1.7]
+      }
+    },
+    {
+      "stage": "color_correction",
+      "enabled": true,
+      "domain": "rgb_linear",
+      "params": {
+        "space": "BT.709"
+      }
+    },
+    {
+      "stage": "denoise",
+      "enabled": true,
+      "domain": "rgb_linear",
+      "params": {
+        "strength": 0.15
+      }
+    },
+    {
+      "stage": "sharpen",
+      "enabled": true,
+      "domain": "rgb_display",
+      "params": {
+        "amount": 0.2
+      }
+    },
+    {
+      "stage": "tonemap",
+      "enabled": true,
+      "domain": "display",
+      "params": {
+        "mode": "ACES"
+      }
+    },
+    {
+      "stage": "gamma_encode",
+      "enabled": true,
+      "domain": "display",
+      "params": {
+        "target": "sRGB"
+      }
+    }
+  ],
+  "output": {
+    "pixel_format": "RGBA8",
+    "color_space": "sRGB",
+    "transfer_function": "sRGB",
+    "bit_depth": 8,
+    "container": "png",
+    "channels": ["R", "G", "B", "A"],
+    "save_raw": false,
+    "save_processed": true,
+    "include_metadata_sidecar": true
+  },
+  "calibration": {
+    "intrinsics_source": "opencv_calibration",
+    "distortion_source": "opencv_calibration",
+    "oecf_ref": null,
+    "calibration_date": "2026-03-01"
+  },
+  "environment_assumptions": {},
+  "runtime": {
+    "render_pipeline": "HDRP",
+    "shader_variant": "tv_sensor",
+    "render_scale": 1.0
+  },
+  "validation": {
+    "reference_sensor": "generic_machine_vision_rgb",
+    "target_metrics": {
+      "snr_midgray_db": 36.0
+    }
+  },
+  "provenance": {
+    "author": "RenÃ©",
+    "created_at": "2026-03-06",
+    "notes": "Initial TV preset"
+  },
+  "extensions": {}
+}
+```
+
+# Example: infrared LWIR camera
+
+```json
+{
+  "$schema": "https://example.org/schemas/sensor-config.schema.json",
+  "schema_version": "1.0.0",
+  "id": "cam_front_lwir",
+  "label": "Front LWIR Camera",
+  "description": "Forward thermal sensor with display AGC and false color",
+  "enabled": true,
+  "modality": "infrared",
+  "variant": "lwir",
+  "frames": {
+    "sensor_frame": "cam_front_lwir_optical",
+    "parent_frame": "vehicle_base",
+    "handedness": "left",
+    "optical_axis": "forward",
+    "up_axis": "up"
+  },
+  "mount": {
+    "position_m": [1.20, 0.10, 1.55],
+    "rotation_deg": [0.0, 0.0, 0.0]
+  },
+  "timing": {
+    "sensor_tick_s": 0.033333,
+    "frame_rate_hz": 30.0,
+    "exposure_time_ms": 8.0,
+    "readout_mode": "global_shutter",
+    "readout_time_ms": 0.0,
+    "latency_ms": 20.0,
+    "timestamp_source": "sim_time"
+  },
+  "optics": {
+    "projection_model": "pinhole",
+    "resolution_px": [640, 512],
+    "intrinsics_px": {
+      "fx": 480.0,
+      "fy": 480.0,
+      "cx": 320.0,
+      "cy": 256.0,
+      "skew": 0.0
+    },
+    "distortion": {
+      "model": "plumb_bob",
+      "coeffs": {
+        "k1": 0.0,
+        "k2": 0.0,
+        "p1": 0.0,
+        "p2": 0.0,
+        "k3": 0.0
+      }
+    },
+    "f_number": 1.2,
+    "focus_distance_m": 100.0,
+    "transmittance": 0.90
+  },
+  "sensor": {
+    "detector_type": "uncooled_microbolometer",
+    "band_um": [8.0, 14.0],
+    "pixel_pitch_um": 12.0,
+    "netd_mK": 50.0,
+    "radiometric_mode": true
+  },
+  "electronics": {
+    "analog_gain_db": 0.0,
+    "digital_gain": 1.0,
+    "black_level_dn": 0,
+    "adc_bits": 14,
+    "saturation_dn": 16383,
+    "read_noise_e": null,
+    "dsnu_dn": 3.0,
+    "prnu_rel": 0.01,
+    "quantization": {
+      "enabled": true
+    },
+    "bad_pixels": {
+      "enabled": true,
+      "density_ppm": 30
+    }
+  },
+  "postprocess": [
+    {
+      "stage": "agc",
+      "enabled": true,
+      "domain": "display",
+      "params": {
+        "mode": "histogram_clip",
+        "clip_percent_low": 0.5,
+        "clip_percent_high": 99.5
+      }
+    },
+    {
+      "stage": "denoise",
+      "enabled": true,
+      "domain": "display",
+      "params": {
+        "algorithm": "bilateral",
+        "strength": 0.2
+      }
+    },
+    {
+      "stage": "colormap",
+      "enabled": true,
+      "domain": "display",
+      "params": {
+        "palette": "ironbow"
+      }
+    }
+  ],
+  "output": {
+    "pixel_format": "R16F",
+    "color_space": "linear",
+    "transfer_function": "linear",
+    "bit_depth": 16,
+    "container": "exr",
+    "channels": ["temperature_proxy"],
+    "save_raw": true,
+    "save_processed": true,
+    "include_metadata_sidecar": true
+  },
+  "calibration": {
+    "intrinsics_source": "estimated",
+    "distortion_source": "estimated",
+    "radiometric_calibration_ref": "internal_lwir_v1"
+  },
+  "environment_assumptions": {
+    "ambient_temperature_C": 20.0,
+    "emissivity_default": 0.95,
+    "reflected_apparent_temperature_C": 20.0,
+    "path_length_m": 10.0
+  },
+  "runtime": {
+    "render_pipeline": "HDRP",
+    "shader_variant": "lwir_sensor",
+    "render_scale": 1.0
+  },
+  "validation": {
+    "reference_sensor": "generic_lwir_core",
+    "target_metrics": {
+      "netd_mK": 50.0
+    }
+  },
+  "provenance": {
+    "author": "RenÃ©",
+    "created_at": "2026-03-06",
+    "notes": "Initial LWIR preset"
+  },
+  "extensions": {}
+}
+```
+
+# Explanation of variables
+
+## Top-level metadata
+
+### `$schema`
+Points to the JSON Schema used for validation.
+
+### `schema_version`
+Version of the configuration format.
+
+### `id`
+Stable machine-facing identifier.
+
+### `label`
+Human-readable display name.
+
+### `description`
+Short explanation of the preset.
+
+### `enabled`
+Whether the preset is active.
+
+### `modality`
+Broad sensing class such as visible or infrared.
+
+### `variant`
+Subtype such as rgb, mono, lwir, or mwir.
+
+## `frames`
+
+### `sensor_frame`
+Name of the sensorâs own frame.
+
+### `parent_frame`
+Frame relative to which the sensor is mounted.
+
+### `handedness`
+Whether coordinates are left- or right-handed.
+
+### `optical_axis`
+Which axis points along the viewing direction.
+
+### `up_axis`
+Which axis defines image up.
+
+## `mount`
+
+### `position_m`
+Translation relative to the parent frame, in meters.
+
+### `rotation_deg`
+Rotation relative to the parent frame, in degrees.
+
+## `timing`
+
+### `sensor_tick_s`
+How often sensor logic runs.
+
+### `frame_rate_hz`
+Nominal output frame rate.
+
+### `exposure_time_ms`
+Integration time per frame.
+
+### `readout_mode`
+Usually global shutter or rolling shutter.
+
+### `readout_time_ms`
+Readout duration, especially important for rolling shutter.
+
+### `latency_ms`
+Delay from acquisition to output.
+
+### `timestamp_source`
+Which clock is used for timestamps.
+
+## `optics`
+
+### `projection_model`
+Projection family such as pinhole or fisheye.
+
+### `resolution_px`
+Image size as width and height.
+
+### `intrinsics_px.fx`
+Horizontal focal length in pixels.
+
+### `intrinsics_px.fy`
+Vertical focal length in pixels.
+
+### `intrinsics_px.cx`
+Principal point x-coordinate in pixels.
+
+### `intrinsics_px.cy`
+Principal point y-coordinate in pixels.
+
+### `intrinsics_px.skew`
+Skew term of the intrinsic matrix, usually zero.
+
+### `distortion.model`
+Distortion model identifier.
+
+### `distortion.coeffs.k1`, `k2`, `k3`
+Radial distortion coefficients.
+
+### `distortion.coeffs.p1`, `p2`
+Tangential distortion coefficients.
+
+### `f_number`
+Lens speed.
+
+### `focus_distance_m`
+Distance of best focus.
+
+### `transmittance`
+Fraction of incoming energy passed by the optics.
+
+### `vignetting.enabled`
+Whether optical corner falloff is simulated.
+
+## `sensor`
+
+### `pixel_pitch_um`
+Physical detector pitch in micrometers.
+
+### `cfa_pattern`
+Bayer arrangement for visible sensors.
+
+### `quantum_efficiency`
+Fraction of incoming photons converted into charge.
+
+### `full_well_capacity_e`
+Maximum electrons before saturation.
+
+### `spectral_response_ref`
+Reference to spectral response data.
+
+### `detector_type`
+Detector family, especially useful for IR.
+
+### `band_um`
+Spectral band in micrometers.
+
+### `netd_mK`
+Noise Equivalent Temperature Difference.
+
+### `radiometric_mode`
+Whether thermal output is intended to preserve measurement meaning.
+
+## `electronics`
+
+### `analog_gain_db`
+Analog amplification before digitization.
+
+### `digital_gain`
+Numerical scaling after digitization.
+
+### `iso_like_gain`
+ISO-style user-facing sensitivity proxy.
+
+### `black_level_dn`
+Digital pedestal in darkness.
+
+### `adc_bits`
+ADC precision in bits.
+
+### `saturation_dn`
+Maximum digital code before clipping.
+
+### `read_noise_e`
+Readout noise referred to electrons.
+
+### `dark_current_e_s`
+Thermally generated charge per second.
+
+### `dsnu_dn`
+Dark Signal Non-Uniformity.
+
+### `prnu_rel`
+Photo Response Non-Uniformity.
+
+### `quantization.enabled`
+Whether ADC quantization is simulated.
+
+### `bad_pixels.enabled`
+Whether defect pixels are simulated.
+
+### `bad_pixels.density_ppm`
+Defect density per million pixels.
+
+## `postprocess`
+
+This is an ordered list because order matters.
+
+Each stage contains:
+
+### `stage`
+Name of the processing operation.
+
+### `enabled`
+Whether the stage is active.
+
+### `domain`
+Signal domain in which the stage operates.
+
+### `params`
+Stage-specific parameter block.
+
+Common examples:
+- demosaic
+- white_balance
+- color_correction
+- denoise
+- sharpen
+- tonemap
+- gamma_encode
+- agc
+- colormap
+
+## `output`
+
+### `pixel_format`
+Internal or exported pixel format.
+
+### `color_space`
+Color space such as sRGB or linear.
+
+### `transfer_function`
+Encoding function such as linear or sRGB.
+
+### `bit_depth`
+Saved bit depth per channel.
+
+### `container`
+File or export format such as png or exr.
+
+### `channels`
+Semantic meaning of output channels.
+
+### `save_raw`
+Whether raw-like output is saved.
+
+### `save_processed`
+Whether processed output is saved.
+
+### `include_metadata_sidecar`
+Whether metadata is exported alongside the image.
+
+## `calibration`
+
+### `intrinsics_source`
+Where intrinsics came from.
+
+### `distortion_source`
+Where distortion parameters came from.
+
+### `oecf_ref`
+Reference to response or conversion characterization data.
+
+### `calibration_date`
+Date of calibration or fitting.
+
+### `radiometric_calibration_ref`
+Reference to thermal calibration data.
+
+## `environment_assumptions`
+
+### `ambient_temperature_C`
+Ambient environmental temperature.
+
+### `emissivity_default`
+Default emissivity if object-specific values are unavailable.
+
+### `reflected_apparent_temperature_C`
+Apparent temperature of reflected surroundings.
+
+### `path_length_m`
+Distance through atmosphere to the observed target.
+
+### `atmospheric_model`
+Atmospheric attenuation or compensation model.
+
+## `runtime`
+
+### `render_pipeline`
+Target Unity render pipeline.
+
+### `shader_variant`
+Concrete runtime implementation family.
+
+### `compute_shader`
+Optional compute implementation identifier.
+
+### `render_scale`
+Resolution scale multiplier.
+
+### `async_readback`
+Whether GPU-to-CPU transfer is asynchronous.
+
+### `gpu_only`
+Whether the data remains entirely on the GPU.
+
+### `allow_realtime_override`
+Whether parameters may be changed live.
+
+## `validation`
+
+### `reference_sensor`
+Comparison target.
+
+### `target_metrics`
+Expected quantitative behavior.
+
+### `golden_scene_ids`
+Reference scenes for regression testing.
+
+### `tolerance`
+Allowed deviation from targets.
+
+## `provenance`
+
+### `author`
+Who created or curates the preset.
+
+### `created_at`
+Creation date.
+
+### `modified_at`
+Last modification date.
+
+### `notes`
+Free-text notes.
+
+### `source_documents`
+References used to derive the preset.
+
+### `measured_vs_estimated`
+Whether values are measured, estimated, stylized, or hybrid.
+
+### `git_commit`
+Optional revision reference.
+
+## `extensions`
+
+Project-specific extra fields that are not yet standardized.
+
+# Practical recommendation
+
+For a first strong implementation, use:
+
+- `id`, `label`, `description`
+- `modality`, `variant`
+- `frames`, `mount`, `timing`
+- `optics`, `sensor`, `electronics`
+- ordered `postprocess`
+- `output`
+- `runtime`
+- `provenance`
+
+Then add:
+- `calibration`
+- `validation`
+- `environment_assumptions`
+
+as soon as the simulator becomes more quantitative or more measurement-oriented.
+
+For naming, use both:
+- `id` for code-facing stable identifiers
+- `label` for human-facing names
+
+Example:
+- `id`: `cam_front_lwir_main`
+- `label`: `Front LWIR Main`
+
+# Sources
+
+## Camera characterization and sensor metrics
+- EMVA 1288 documentation for concepts such as gain, dark noise, DSNU, PRNU, and dynamic range. îciteîturn5search7îturn0search32î
+
+## Camera geometry and calibration conventions
+- ROS `sensor_msgs/CameraInfo` for frame, intrinsics, distortion, and image geometry conventions. îciteîturn6search2î
+- OpenCV camera calibration documentation for pinhole intrinsics and distortion coefficient conventions. îciteîturn6search3î
+
+## Infrared and thermal background
+- FLIR references for detector type, spectral band, NETD, emissivity, reflected apparent temperature, and thermal measurement semantics. îciteîturn5search5îturn5search8îturn5search1î
+
+## Simulator configuration examples
+- AirSim settings documentation as an example of versioned simulator settings and camera or noise configuration philosophy. îciteîturn8search14îturn1search4îturn8search2î
+
+## Output and display semantics
+- sRGB / W3C references for display color-space context. îciteîturn3search2î
+- BT.2100 / HDR-related references for transfer-function distinctions. îciteîturn3search1î
+
+# Closing note
+
+The most important design decision is not the exact naming of the keys. It is preserving the difference between:
+
+- how the scene is projected
+- how the detector responds
+- how electronics digitize that response
+- how later processing changes the signal for display or export
+
+Once that distinction is respected, the schema becomes much easier to grow, validate, and reason about.
